@@ -32,7 +32,7 @@ const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsa
 
 pub async fn serve(home: Home, open: bool) -> Result<()> {
     let port = home.config.port;
-    let guard = Arc::new(Guard::new(port, home.config.listen, Net::load(&home)));
+    let guard = Arc::new(Guard::new(port, home.config.listen, home.config.hostname.clone(), Net::load(&home)));
     let url = format!("http://localhost:{port}");
     let listener = match TcpListener::bind(SocketAddr::new(guard.address(), port)).await {
         Ok(l) => l,
@@ -184,6 +184,8 @@ fn router(home: Home, guard: Arc<Guard>, shutdown: CancellationToken) -> Router 
 struct Guard {
     port: u16,
     listen: IpAddr,
+    /// Public hostname a tunnel/proxy fronts the board with (Para fork).
+    hostname: String,
     net: Mutex<Net>,
     guests: Mutex<HashMap<IpAddr, (Instant, Option<String>)>>,
     names: OnceLock<Vec<String>>,
@@ -194,10 +196,11 @@ struct Guard {
 const GUEST_GONE: Duration = Duration::from_secs(30);
 
 impl Guard {
-    fn new(port: u16, listen: IpAddr, net: Net) -> Self {
+    fn new(port: u16, listen: IpAddr, hostname: String, net: Net) -> Self {
         Self {
             port,
             listen,
+            hostname: hostname.to_ascii_lowercase(),
             net: Mutex::new(net),
             guests: Mutex::default(),
             names: OnceLock::new(),
@@ -270,6 +273,9 @@ impl Guard {
             return false;
         }
         let name = name.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+        if !self.hostname.is_empty() && name.eq_ignore_ascii_case(&self.hostname) {
+            return true;
+        }
         let ip = name.parse::<IpAddr>().ok();
         if name.eq_ignore_ascii_case("localhost") || ip.is_some_and(|ip| ip.is_loopback()) {
             return true;
@@ -301,10 +307,14 @@ async fn protect(State(guard): State<Arc<Guard>>, req: Request, next: Next) -> R
     let ok = {
         let header = |name| req.headers().get(name).and_then(|h: &HeaderValue| h.to_str().ok());
         let host = header(header::HOST).unwrap_or("");
+        // A tunnel/proxy terminates TLS, so Origins under the public hostname
+        // arrive as https:// while direct local requests stay http://.
         let same_origin = |o: &str| {
-            o.len() == host.len() + 7
-                && o.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
-                && o.as_bytes()[7..].eq_ignore_ascii_case(host.as_bytes())
+            ["http://", "https://"].iter().any(|scheme| {
+                o.len() == host.len() + scheme.len()
+                    && o[..scheme.len()].eq_ignore_ascii_case(scheme)
+                    && o[scheme.len()..].eq_ignore_ascii_case(host)
+            })
         };
         guard.allows(host) && header(header::ORIGIN).is_none_or(same_origin) && (guest.is_none() || guard.lan())
     };
@@ -794,7 +804,7 @@ mod tests {
 
     #[test]
     fn hosts() {
-        let local = Guard::new(4242, Ipv4Addr::LOCALHOST.into(), Net::Private);
+        let local = Guard::new(4242, Ipv4Addr::LOCALHOST.into(), String::new(), Net::Private);
         for ok in ["localhost", "localhost:4242", "127.0.0.1:4242", "[::1]:4242", "LOCALHOST:4242"] {
             assert!(local.allows(ok), "{ok}");
         }
@@ -802,7 +812,15 @@ mod tests {
             assert!(!local.allows(bad), "{bad}");
         }
 
-        let lan = Guard::new(4242, Ipv4Addr::LOCALHOST.into(), Net::Sharing);
+        let public = Guard::new(4242, Ipv4Addr::LOCALHOST.into(), "kanban.example.com".into(), Net::Private);
+        for ok in ["kanban.example.com", "KANBAN.EXAMPLE.COM", "kanban.example.com:4242"] {
+            assert!(public.allows(ok), "{ok}");
+        }
+        for bad in ["kanban.example.com:80", "not-kanban.example.com", "kanban.example.com.evil.com"] {
+            assert!(!public.allows(bad), "{bad}");
+        }
+
+        let lan = Guard::new(4242, Ipv4Addr::LOCALHOST.into(), String::new(), Net::Sharing);
         lan.names.set(vec!["pi".into(), "pi.local".into()]).unwrap();
         for ok in ["localhost:4242", "192.168.1.5:4242", "[fe80::1]:4242", "pi.local:4242", "pi:4242", "PI.LOCAL."] {
             assert!(lan.allows(ok), "{ok}");

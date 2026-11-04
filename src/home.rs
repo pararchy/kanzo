@@ -26,6 +26,11 @@ listen = "127.0.0.1"
 # Also serve MCP over HTTP at http://localhost:<port>/mcp, for agents
 # that cannot start `kanzo mcp` themselves.
 mcp_http = true
+
+# Public hostname the board is served under, e.g. through a tunnel or
+# reverse proxy that puts its own auth in front. The proxy terminates TLS,
+# so requests arrive over plain HTTP with this Host header.
+hostname = ""
 "#;
 
 const GITIGNORE: &str = "\
@@ -54,11 +59,20 @@ pub struct Config {
     #[serde(rename = "statuses")]
     _statuses: Option<toml::Value>,
     pub mcp_http: bool,
+    /// Extra hostname allowed through the Host/Origin guard, for a tunnel or
+    /// reverse proxy that terminates TLS and puts its own auth in front.
+    pub hostname: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { port: DEFAULT_PORT, listen: IpAddr::V4(Ipv4Addr::LOCALHOST), _statuses: None, mcp_http: true }
+        Self {
+            port: DEFAULT_PORT,
+            listen: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            _statuses: None,
+            mcp_http: true,
+            hostname: String::new(),
+        }
     }
 }
 
