@@ -52,7 +52,10 @@ pub fn newer(version: &str) -> bool {
 }
 
 pub fn install() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).map_err(|e| e.to_string())?;
+    if releases() == RELEASES {
+        return Err("This Para fork cannot install upstream binaries: they remove public-hostname support. Update github.com/pararchy/kanzo from source as described in README.md, or set KANZO_RELEASES_URL to compatible fork releases.".into());
+    }
+    let exe = program().map_err(|e| e.to_string())?;
     // The installer writes to <dir>/bin, so it can only replace a program kept in a bin folder.
     let dir = match exe.parent() {
         Some(bin) if bin.file_name().is_some_and(|n| n == "bin") => bin.parent().unwrap_or(bin).to_path_buf(),
@@ -81,6 +84,16 @@ pub fn install() -> Result<PathBuf, String> {
         return Err(format!("the installer failed: {}", last.trim()));
     }
     Ok(exe)
+}
+
+/// Where this program is, past any symlink. On Windows that comes back as `\\?\C:\…`, which
+/// the PowerShell installer can't install to, so it goes back to `C:\…`.
+fn program() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    match exe.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        Some(plain) if plain.as_bytes().get(1) == Some(&b':') => Ok(PathBuf::from(plain)),
+        _ => Ok(exe),
+    }
 }
 
 /// Named for its version: an agent's `kanzo mcp` can keep an older one running, and locked.
@@ -135,8 +148,9 @@ fn run_installer(script: &[u8], dir: &Path) -> Result<Output, String> {
 #[cfg(unix)]
 fn restart_args(args: impl Iterator<Item = OsString>) -> Vec<OsString> {
     let mut args: Vec<OsString> = args.collect();
+    // First, since it isn't an option of a subcommand like `network on`.
     if !args.iter().any(|a| a == "--no-open") {
-        args.push("--no-open".into());
+        args.insert(0, "--no-open".into());
     }
     args
 }
@@ -160,6 +174,61 @@ pub fn restart(_exe: &Path) -> std::io::Error {
 /// On Windows only the service's board can restart: a running program can't replace itself there.
 pub fn can_restart(home: &Path) -> bool {
     cfg!(unix) || crate::service::is_task_board(home)
+}
+
+/// The program file this process started from. `kanzo update`, the installer, Homebrew or
+/// `cargo install` replace it with a new file, and a running process keeps the old one, so
+/// each long-running process watches for that and runs the new program in its place.
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct Exe {
+    path: PathBuf,
+    stamp: (u64, std::time::SystemTime),
+}
+
+#[cfg(unix)]
+impl Exe {
+    pub fn current() -> Option<Exe> {
+        let path = std::env::current_exe().ok()?;
+        let stamp = stamp(&path)?;
+        Some(Exe { path, stamp })
+    }
+
+    /// One `stat`, cheap enough to check on every message.
+    pub fn changed(&self) -> bool {
+        stamp(&self.path).is_some_and(|s| s != self.stamp)
+    }
+
+    /// The new program, once it runs: a file still being written doesn't, and the next check tries again.
+    pub fn replacement(&self) -> Option<&Path> {
+        let runs = Command::new(&self.path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        (self.changed() && runs).then_some(&self.path)
+    }
+}
+
+#[cfg(unix)]
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.ino(), meta.modified().ok()?))
+}
+
+/// Runs the new program as this process, with the same arguments.
+#[cfg(unix)]
+pub fn exec(exe: &Path, env: Option<(&str, &std::ffi::OsStr)>) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(exe);
+    cmd.args(std::env::args_os().skip(1));
+    if let Some((key, value)) = env {
+        cmd.env(key, value);
+    }
+    cmd.exec()
 }
 
 #[cfg(test)]
@@ -189,10 +258,18 @@ mod tests {
     }
 
     #[test]
+    fn the_installer_gets_a_folder_it_can_use() {
+        let exe = program().unwrap();
+        assert!(exe.is_absolute() && exe.is_file(), "{}", exe.display());
+        assert!(!exe.to_string_lossy().starts_with(r"\\?\"), "{}", exe.display());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn restarts_without_opening_a_tab() {
         let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
-        assert_eq!(restart_args(args(&["--port", "4300"]).into_iter()), args(&["--port", "4300", "--no-open"]));
+        assert_eq!(restart_args(args(&["--port", "4300"]).into_iter()), args(&["--no-open", "--port", "4300"]));
+        assert_eq!(restart_args(args(&["network", "on"]).into_iter()), args(&["--no-open", "network", "on"]));
         assert_eq!(restart_args(args(&["--no-open"]).into_iter()), args(&["--no-open"]));
     }
 }

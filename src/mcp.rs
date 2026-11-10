@@ -1,5 +1,6 @@
 //! Replies are short plain text to save agents' tokens.
 
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -17,7 +18,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, Peer, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +38,8 @@ macro_rules! instructions {
             " machine, for all their projects. Tasks look like api#12. ",
             $project,
             " Keep it current unasked: doing when you start a task, comments on what you did, review when you \
-             finish or get stuck. Leave done and human tasks to the user."
+             finish or get stuck, url for a PR you opened. On review, comment how to resume this session. Leave done and human tasks to the user. \
+             Link files as [name](file:///path)."
         )
     };
 }
@@ -55,6 +57,16 @@ pub async fn serve(home: Home) -> Result<()> {
     let images = home.images();
     let ctx = Ctx { home, cwd: Some(cwd), repos, images, host: Default::default() };
     let server = Kanzo { ctx: Arc::new(ctx), tool_router: Kanzo::tools() };
+    serve_stdio(server).await
+}
+
+#[cfg(unix)]
+use crate::stdio::serve as serve_stdio;
+
+/// Windows can't replace a running program, so there an agent's `kanzo mcp` keeps its version.
+#[cfg(not(unix))]
+async fn serve_stdio(server: Kanzo) -> Result<()> {
+    use rmcp::ServiceExt;
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -130,6 +142,14 @@ fn reply(outcome: Result<String, String>) -> CallToolResult {
     }
 }
 
+/// Clients on protocol 2026-07-28 name themselves on every request; older ones did once, in `initialize`.
+fn caller(context: &RequestContext<RoleServer>) -> Option<Implementation> {
+    match context.meta.protocol_version() {
+        Some(_) => context.meta.client_info(),
+        None => context.peer.peer_info().map(|p| p.client_info.clone()),
+    }
+}
+
 fn git_repos(dir: &std::path::Path) -> Vec<String> {
     let Ok(text) = crate::home::output(Command::new("git").arg("-C").arg(dir).args(["remote", "-v"])) else {
         return Vec::new();
@@ -186,6 +206,9 @@ struct ListTasksArgs {
     project: Option<String>,
     /// One column, or "all". Done is left out by default.
     status: Option<String>,
+    /// Words, or tag: status: project: title: description: url: comment: id: comments: images: created: updated:
+    /// is:human is:waiting has: no:, like tag:bug -status:done. Includes done.
+    filter: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -208,6 +231,8 @@ struct CreateTaskArgs {
     status: Option<String>,
     /// For the user, not for agents.
     human: Option<bool>,
+    /// Tasks it waits on, like api#12.
+    waits_on: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -224,6 +249,10 @@ struct UpdateTaskArgs {
     tags: Option<String>,
     /// For the user, not for agents.
     human: Option<bool>,
+    /// A link; "" clears.
+    url: Option<String>,
+    /// Tasks it waits on, like api#12; "" clears.
+    waits_on: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -249,6 +278,8 @@ struct LinkRepoArgs {
 struct NextTaskArgs {
     /// Slug, or "all".
     project: Option<String>,
+    /// As in list_tasks, like tag:bug.
+    filter: Option<String>,
 }
 
 impl Kanzo {
@@ -378,25 +409,34 @@ impl Kanzo {
         Ok(self
             .run_for(&ext, move |ctx, store| {
                 let project = ctx.scope(store, args.project.as_deref())?;
-                let status = args.status.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let only = match status {
+                let status = args.status.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+                let only = match status.as_deref() {
                     Some("all") | None => None,
                     Some(s) => {
                         store.check_status(s)?;
                         Some(s)
                     }
                 };
-                let keep = if status.is_none() { 0 } else { DONE_LISTED };
-                let (tasks, hidden) =
-                    store.list_tasks_keeping_done(project.as_ref().map(|p| p.id), only, Some(keep))?;
+                let filter = args.filter.filter(|f| !f.trim().is_empty());
+                let keep = match (&filter, &status) {
+                    (Some(_), _) => None,
+                    (None, None) => Some(0),
+                    (None, Some(_)) => Some(DONE_LISTED),
+                };
+                let (mut tasks, hidden) = store.list_tasks_keeping_done(project.as_ref().map(|p| p.id), only, keep)?;
+                if let Some(filter) = &filter {
+                    let found: HashSet<i64> = store.search_for_agent(filter)?.into_iter().map(|t| t.id).collect();
+                    tasks.retain(|t| found.contains(&t.id));
+                }
                 let done = store::DONE;
+                let properties = store.hidden_properties()?;
                 let mut out = String::new();
                 let mut people = 0;
                 for t in &tasks {
                     if t.human {
                         people += 1;
                     } else {
-                        task_line(&mut out, t);
+                        task_line(&mut out, t, &properties);
                         out.push('\n');
                     }
                 }
@@ -404,7 +444,7 @@ impl Kanzo {
                     let scope = project.as_ref().map_or("any project", |p| p.slug.as_str());
                     let _ = writeln!(out, "No tasks in {scope}.");
                 }
-                if people > 0 {
+                if people > 0 && shown(&properties, "human") {
                     let _ = writeln!(
                         out,
                         "({people} human {} not shown: for the user, not for agents)",
@@ -444,15 +484,12 @@ impl Kanzo {
     ) -> Result<CallToolResult, ErrorData> {
         Ok(self
             .run_for(&ext, move |ctx, store| {
-                let project = ctx.project(store, args.project.as_deref())?;
-                let status = args.status.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
-                let description = args.description.as_deref().unwrap_or("");
-                let mut t = store.create_task_in(project.id, status.as_deref(), &args.title, description)?;
-                if args.tags.is_some() || args.human.is_some() {
-                    t = store
-                        .update_task(t.id, TaskPatch { tags: args.tags, human: args.human, ..Default::default() })?;
-                }
-                Ok(format!("Created {} in {}: {}", t.key(), t.status, t.title))
+                let CreateTaskArgs { title, description, project, tags, status, human, waits_on } = args;
+                let project = ctx.project(store, project.as_deref())?;
+                let status = status.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+                let patch = TaskPatch { description, status, tags, human, waits_on, ..Default::default() };
+                let t = store.create_task_in(project.id, &title, patch)?;
+                Ok(format!("Created {} in {}: {}{}", t.key(), t.status, t.title, waits_note(store, &t)?))
             })
             .await)
     }
@@ -472,6 +509,8 @@ impl Kanzo {
                         tags: args.tags,
                         project_id: None,
                         human: args.human,
+                        url: args.url,
+                        waits_on: args.waits_on,
                     },
                 )?;
                 let moved = if before.status != after.status {
@@ -479,7 +518,7 @@ impl Kanzo {
                 } else {
                     String::new()
                 };
-                Ok(format!("Updated {}{moved}: {}", after.key(), after.title))
+                Ok(format!("Updated {}{moved}: {}{}", after.key(), after.title, waits_note(store, &after)?))
             })
             .await)
     }
@@ -488,9 +527,9 @@ impl Kanzo {
     async fn add_comment(
         &self,
         Parameters(args): Parameters<AddCommentArgs>,
-        peer: Peer<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = peer.peer_info().map(|i| i.client_info.name.clone()).filter(|n| !n.is_empty());
+        let client = caller(&context).map(|i| i.name).filter(|n| !n.is_empty());
         let author = args.author.filter(|a| !a.trim().is_empty()).or(client).unwrap_or_else(|| "agent".into());
         Ok(self
             .run(move |_, store| {
@@ -510,11 +549,18 @@ impl Kanzo {
         Ok(self
             .run_for(&ext, move |ctx, store| {
                 let project = ctx.scope(store, args.project.as_deref())?;
-                match store.next_task(project.as_ref().map(|p| p.id))? {
+                let id = project.as_ref().map(|p| p.id);
+                let filter = args.filter.as_deref().unwrap_or("");
+                match store.next_task_matching(id, filter)? {
                     Some(task) => Ok(format!("Moved to {}:\n{}", task.status, task_detail(ctx, store, &task)?)),
                     None => {
+                        let waiting = store.waiting_in_todo(id, filter)?;
                         let scope = project.map_or("any project".into(), |p| p.slug);
-                        Ok(format!("Nothing in todo for {scope}."))
+                        Ok(match waiting {
+                            0 => format!("Nothing in todo for {scope}."),
+                            1 => format!("Nothing ready in todo for {scope}: 1 task waits on others."),
+                            n => format!("Nothing ready in todo for {scope}: {n} tasks wait on others."),
+                        })
                     }
                 }
             })
@@ -526,8 +572,10 @@ impl Kanzo {
         Ok(self
             .run(move |ctx, store| {
                 let task = args.id.find(store)?;
+                let properties = store.hidden_properties()?;
                 ctx.home.deleting_images(store, store::ImagesOf::Task(task.id), || store.delete_task(task.id))?;
-                let comments = match task.comments {
+                let count = if shown(&properties, "comments") { task.comments } else { 0 };
+                let comments = match count {
                     0 => String::new(),
                     1 => " and its comment".into(),
                     n => format!(" and its {n} comments"),
@@ -556,7 +604,7 @@ impl ServerHandler for Kanzo {
             if upstream.as_ref().is_none_or(|u| u.host() != host) {
                 *upstream = Some(share::Upstream::new(host, cwd, &self.ctx.repos, &self.ctx.images));
             }
-            let client = context.peer.peer_info().and_then(|p| serde_json::to_value(&*p).ok());
+            let client = share::handshake(context.peer.peer_info().as_deref(), &context.meta);
             let upstream = upstream.as_mut().expect("set above");
             let outcome = upstream.call(client, &request.name, request.arguments).await;
             return Ok(reply(outcome).into());
@@ -565,16 +613,25 @@ impl ServerHandler for Kanzo {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
             .with_server_info(Implementation::new("kanzo", env!("CARGO_PKG_VERSION")))
             .with_instructions(if self.ctx.cwd.is_some() { INSTRUCTIONS } else { HTTP_INSTRUCTIONS })
     }
 }
 
-fn task_line(out: &mut String, t: &Task) {
+fn shown(hidden: &[String], property: &str) -> bool {
+    !hidden.iter().any(|p| p == property)
+}
+
+fn task_line(out: &mut String, t: &Task, hidden: &[String]) {
     let _ = write!(out, "{} [{}] {}", t.key(), t.status, t.title);
-    write_tags(out, t);
-    match t.comments {
+    if shown(hidden, "tags") {
+        write_tags(out, t);
+    }
+    if shown(hidden, "waiting") {
+        write_waits(out, t);
+    }
+    match if shown(hidden, "comments") { t.comments } else { 0 } {
         0 => {}
         1 => out.push_str(" (1 comment)"),
         n => {
@@ -589,26 +646,53 @@ fn write_tags(out: &mut String, t: &Task) {
     }
 }
 
+fn write_waits(out: &mut String, t: &Task) {
+    if !t.waiting_on.is_empty() {
+        let ids: Vec<String> = t.waiting_on.iter().map(|id| format!("#{id}")).collect();
+        let _ = write!(out, " (waits on {})", ids.join(", "));
+    }
+}
+
+/// Tells an agent that moved or changed a task that it's still waiting; moving one anyway is allowed.
+fn waits_note(store: &Store, t: &Task) -> store::Result<String> {
+    let mut note = String::new();
+    if !t.waiting_on.is_empty() && shown(&store.hidden_properties()?, "waiting") {
+        write_waits(&mut note, t);
+    }
+    Ok(note)
+}
+
 fn task_detail(ctx: &Ctx, store: &Store, t: &Task) -> store::Result<String> {
-    let comments = store.list_comments(t.id)?;
-    let images = store.list_images(t.id)?;
+    let hidden = store.hidden_properties()?;
+    let comments = if shown(&hidden, "comments") { store.list_comments(t.id)? } else { Vec::new() };
+    let images = if shown(&hidden, "images") { store.list_images(t.id)? } else { Vec::new() };
     let dir = &ctx.images;
     let paths = |comment: Option<i64>| -> Vec<String> {
         images.iter().filter(|i| i.comment_id == comment).map(|i| dir.join(&i.file).display().to_string()).collect()
     };
     let (created, updated) = (short_time(&t.created_at), short_time(&t.updated_at));
     let mut out = format!("{} {}", t.key(), t.title);
-    write_tags(&mut out, t);
+    if shown(&hidden, "tags") {
+        write_tags(&mut out, t);
+    }
     let _ = write!(out, "\nstatus: {}", t.status);
-    if t.human {
+    if shown(&hidden, "waiting") {
+        write_waits(&mut out, t);
+    }
+    if t.human && shown(&hidden, "human") {
         out.push_str(", human: for the user, not for agents");
     }
-    let _ = write!(out, ", created {created}");
-    if updated != created {
+    if shown(&hidden, "created") {
+        let _ = write!(out, ", created {created}");
+    }
+    if updated != created && shown(&hidden, "updated") {
         let _ = write!(out, ", updated {updated}");
     }
+    if !t.url.is_empty() && shown(&hidden, "url") {
+        let _ = write!(out, "\nurl: {}", t.url);
+    }
     out.push('\n');
-    if !t.description.is_empty() {
+    if !t.description.is_empty() && shown(&hidden, "description") {
         let _ = writeln!(out, "\n{}", t.description);
     }
     let own = paths(None);
@@ -629,4 +713,174 @@ fn task_detail(ctx: &Ctx, store: &Store, t: &Task) -> store::Result<String> {
     }
     out.truncate(out.trim_end().len());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use tokio::io::{
+        AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
+    };
+
+    use rmcp::ServiceExt;
+
+    use super::*;
+
+    const STATELESS: &str = "2026-07-28";
+
+    /// The client side of a `kanzo mcp` on stdio.
+    struct Agent {
+        lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
+        write: WriteHalf<DuplexStream>,
+    }
+
+    impl Agent {
+        fn start(home: Home, folder: &std::path::Path) -> Self {
+            let images = home.images();
+            let ctx = Ctx { home, cwd: Some(folder.into()), repos: Vec::new(), images, host: Default::default() };
+            let server = Kanzo { ctx: Arc::new(ctx), tool_router: Kanzo::tools() };
+            let (ours, theirs) = tokio::io::duplex(1 << 16);
+            tokio::spawn(async move { server.serve(tokio::io::split(theirs)).await.unwrap().waiting().await });
+            let (read, write) = tokio::io::split(ours);
+            Self { lines: BufReader::new(read).lines(), write }
+        }
+
+        /// The reply to `message`, or `None` for a notification.
+        async fn send(&mut self, message: Value) -> Option<Value> {
+            self.write.write_all(format!("{message}\n").as_bytes()).await.unwrap();
+            let id = message.get("id")?;
+            loop {
+                let reply: Value = serde_json::from_str(&self.lines.next_line().await.unwrap().unwrap()).unwrap();
+                if &reply["id"] == id {
+                    return Some(reply);
+                }
+            }
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    fn board() -> (tempfile::TempDir, Home, Task) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path().to_path_buf()).unwrap();
+        let store = home.store().unwrap();
+        let project = store.create_project("api", "", None).unwrap();
+        let task = store.create_task(project.id, "Ship it", "").unwrap();
+        (dir, home, task)
+    }
+
+    /// Serves `home`'s MCP over HTTP on a free port, as a shared board does.
+    async fn shared(home: Home) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().nest_service("/mcp", http_service(home, CancellationToken::new()));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        port
+    }
+
+    fn authors(home: &Home, task: &Task) -> Vec<String> {
+        home.store().unwrap().list_comments(task.id).unwrap().into_iter().map(|c| c.author).collect()
+    }
+
+    fn comment(task: &Task, meta: Value) -> Value {
+        let args = json!({ "id": task.key(), "body": "done" });
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "add_comment", "arguments": args, "_meta": meta } })
+    }
+
+    fn stateless(client: Option<&str>) -> Value {
+        let mut meta = json!({
+            "io.modelcontextprotocol/protocolVersion": STATELESS,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        if let Some(name) = client {
+            meta["io.modelcontextprotocol/clientInfo"] = json!({ "name": name, "version": "1" });
+        }
+        meta
+    }
+
+    #[test]
+    fn agents_see_what_a_task_waits_on_and_why_nothing_is_ready() {
+        block_on(async {
+            let (dir, home, blocker) = board();
+            let mut agent = Agent::start(home.clone(), dir.path());
+            let mut call = async |name: &str, args: Value| -> String {
+                let params = json!({ "name": name, "arguments": args, "_meta": stateless(None) });
+                let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params });
+                let reply = agent.send(message).await.unwrap();
+                reply["result"]["content"][0]["text"].as_str().unwrap().to_string()
+            };
+            let waiting =
+                call("create_task", json!({ "title": "Then this", "project": "api", "waits_on": blocker.key() })).await;
+            assert_eq!(waiting, "Created api#2 in todo: Then this (waits on #1)");
+            assert!(call("list_tasks", json!({ "project": "api" })).await.contains("Then this (waits on #1)"));
+            assert!(call("get_task", json!({ "id": "api#2" })).await.contains("status: todo (waits on #1)"));
+
+            call("update_task", json!({ "id": "api#1", "status": "doing" })).await;
+            let next = call("next_task", json!({ "project": "api" })).await;
+            assert_eq!(next, "Nothing ready in todo for api: 1 task waits on others.");
+            let moved = call("update_task", json!({ "id": "api#2", "status": "doing" })).await;
+            assert_eq!(moved, "Updated api#2, todo -> doing: Then this (waits on #1)");
+            let next = call("next_task", json!({ "project": "api" })).await;
+            assert_eq!(next, "Nothing in todo for api.");
+
+            home.store().unwrap().set_property("waiting", false).unwrap();
+            assert!(!call("get_task", json!({ "id": "api#2" })).await.contains("waits on"));
+        });
+    }
+
+    #[test]
+    fn a_joined_board_takes_calls_from_a_client_that_never_initialized() {
+        block_on(async {
+            let (_host_dir, host, task) = board();
+            let port = shared(host.clone()).await;
+            let guest_dir = tempfile::tempdir().unwrap();
+            std::fs::write(guest_dir.path().join(share::FILE), format!("join 127.0.0.1:{port}\n")).unwrap();
+            let mut agent = Agent::start(Home::open(guest_dir.path().to_path_buf()).unwrap(), guest_dir.path());
+
+            let reply = agent.send(comment(&task, stateless(Some("claude-code")))).await.unwrap();
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            assert_eq!(authors(&host, &task), ["claude-code"]);
+        });
+    }
+
+    #[test]
+    fn comments_are_signed_with_the_name_a_client_initialized_with() {
+        block_on(async {
+            let (dir, home, task) = board();
+            let mut agent = Agent::start(home.clone(), dir.path());
+            let client = json!({ "name": "codex-mcp-client", "version": "1" });
+            let params = json!({ "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": client });
+            agent.send(json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": params })).await;
+            agent.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+
+            let meta = json!({ "io.modelcontextprotocol/clientInfo": { "name": "from-meta", "version": "1" } });
+            agent.send(comment(&task, meta)).await;
+            assert_eq!(authors(&home, &task), ["codex-mcp-client"]);
+        });
+    }
+
+    #[test]
+    fn a_comment_over_http_from_a_client_that_gives_no_name_is_signed_agent() {
+        block_on(async {
+            let (_dir, home, task) = board();
+            let port = shared(home.clone()).await;
+            let body = comment(&task, stateless(None)).to_string();
+            let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let head = format!(
+                "POST /mcp HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                 Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: {STATELESS}\r\n\
+                 Mcp-Method: tools/call\r\nMcp-Name: add_comment\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            conn.write_all(format!("{head}{body}").as_bytes()).await.unwrap();
+            let mut reply = String::new();
+            conn.read_to_string(&mut reply).await.unwrap();
+
+            assert!(reply.contains("Comment added"), "{reply}");
+            assert_eq!(authors(&home, &task), ["agent"]);
+        });
+    }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "kanzo"
-version = "0.3.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.89"
-description = "Self-hosted kanban for humans and agents. One 4 MB binary, starts in 2 ms, zero setup."
+description = "Self-hosted kanban for humans and agents. One 4.7 MB binary, starts in 3 ms, zero setup."
 license = "AGPL-3.0-only"
 repository = "https://github.com/emanuele-em/kanzo"
 homepage = "https://github.com/emanuele-em/kanzo"
@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["kanban", "mcp", "agents", "todo", "claude"]
 categories = ["command-line-utilities", "development-tools"]
 # Only what builds Kanzo: the README's screenshots and the repo's GitHub files stay out.
-exclude = ["/docs", "/.github", "/.cargo", "/dist-workspace.toml", "/rustfmt.toml", "/server.json"]
+exclude = ["/docs", "/.github", "/.cargo", "/dist-workspace.toml", "/rustfmt.toml", "/server.json", "/README.zh.md"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -23,8 +23,8 @@ dirs = "7.0.0"
 if-addrs = "0.15.0"
 # Already built in by other crates; tells which lock errors mean "no locks here".
 libc = "0.2.191"
-rmcp = { version = "=3.8.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
-rusqlite = { version = "0.41.0", features = ["bundled"] }
+rmcp = { version = "=3.9.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rusqlite = { version = "0.41.0", features = ["bundled", "functions"] }
 schemars = "1.2.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
